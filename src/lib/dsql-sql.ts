@@ -21,7 +21,7 @@
 
 import { isOCCError } from "@aws/aurora-dsql-node-postgres-connector";
 import { pendingMigrations } from "../../scripts/migration-plan.mjs";
-import { toSql, type Sql } from "./db.ts";
+import { toSql, type Sql } from "./sql-types.ts";
 
 export type DsqlConfig = {
   host: string;
