@@ -17,7 +17,7 @@
  */
 
 import { pendingMigrations } from "../../scripts/migration-plan.mjs";
-import { toSql, type Sql } from "./db.ts";
+import { toSql, type Sql } from "./sql-types.ts";
 
 /** Minimal structural subset of the Workers `D1PreparedStatement` binding. */
 export interface D1PreparedLike {

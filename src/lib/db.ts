@@ -1,5 +1,11 @@
 import { pendingMigrations } from "../../scripts/migration-plan.mjs";
 import { neonPoolConfig } from "./pg-pool.ts";
+import {
+  toSql,
+  txOverStatements,
+  type Run,
+  type Sql,
+} from "./sql-types.ts";
 
 /** Which database backend is active. */
 export type DbSource = "neon" | "pglite" | "d1" | "rdsdata";
@@ -45,31 +51,13 @@ export const dbSource: DbSource = databaseUrl
       : "pglite";
 
 /**
- * Minimal shared SQL surface, satisfied by both Neon and PGLite. Both the
- * tagged-template and `.query()` forms resolve to an array of row objects:
- *
- *   const sql = await getSql();
- *   const rows = await sql`select * from todos where id = ${id}`; // parameterized
- *   const rows2 = await sql.query("select * from todos where id = $1", [id]);
+ * The `Sql` interface plus `toSql`/`txOverStatements` live in `./sql-types.ts`
+ * — a side-effect-free leaf so adapters and unit tests never trigger this
+ * module's import-time PGLite bootstrap. Re-exported here for all existing
+ * `from "@/lib/db"` consumers.
  */
-export interface Sql {
-  <T = Record<string, unknown>>(
-    strings: TemplateStringsArray,
-    ...values: unknown[]
-  ): Promise<T[]>;
-  query<T = Record<string, unknown>>(
-    text: string,
-    params?: unknown[],
-  ): Promise<T[]>;
-  /** Dialect tag for the few queries whose SQL differs between Postgres and SQLite. */
-  dialect?: "pg" | "sqlite";
-  /**
-   * Run `fn` inside a write transaction: commit on success, rollback on throw.
-   * Backends without interactive transactions (D1) leave this unset — see
-   * `runWriteTx` in `./sql-tx.ts` for the shared call site.
-   */
-  tx?<T>(fn: () => Promise<T>): Promise<T>;
-}
+export { toSql, txOverStatements } from "./sql-types.ts";
+export type { Run, Sql } from "./sql-types.ts";
 
 /**
  * Init state lives on globalThis as promises: dev HMR creates new instances of
@@ -100,43 +88,6 @@ const OID_INT8 = 20;
 const OID_DATE = 1082;
 const OID_INTERVAL = 1186;
 const identity = (v: string) => v;
-
-type Run = <T>(text: string, params: unknown[]) => Promise<T[]>;
-
-/** Wrap a query runner in the tagged-template + `.query()` `Sql` surface. */
-export function toSql(run: Run): Sql {
-  const sql = (async <T = Record<string, unknown>>(
-    strings: TemplateStringsArray,
-    ...values: unknown[]
-  ): Promise<T[]> => {
-    // Rebuild with $1, $2, … placeholders so values stay parameterized.
-    let text = strings[0];
-    for (let i = 0; i < values.length; i += 1) text += `$${i + 1}${strings[i + 1]}`;
-    return run<T>(text, values);
-  }) as unknown as Sql;
-  sql.query = <T = Record<string, unknown>>(text: string, params: unknown[] = []) =>
-    run<T>(text, params);
-  return sql;
-}
-
-/** `begin`/`commit`/`rollback` over plain statements — the Postgres-backed tx. */
-export function txOverStatements(run: Run): NonNullable<Sql["tx"]> {
-  return async <T>(fn: () => Promise<T>): Promise<T> => {
-    await run("begin", []);
-    try {
-      const value = await fn();
-      await run("commit", []);
-      return value;
-    } catch (err) {
-      try {
-        await run("rollback", []);
-      } catch {
-        // The failed transaction is already unusable.
-      }
-      throw err;
-    }
-  };
-}
 
 function createNeonSql(): Promise<Sql> {
   globalRef.__pgSqlPromise__ ??= (async () => {
