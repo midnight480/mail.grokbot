@@ -144,16 +144,17 @@ function authPopupPlugin(): Plugin {
 
 /**
  * Deploy target for the production build. `DEPLOY_TARGET=cf` builds the
- * Cloudflare Workers module (D1 via the `DB` binding); `aws`/`amplify` builds
- * the AWS Amplify compute bundle. Unset keeps the Vercel output. The dev
+ * Cloudflare Workers module (D1 via the `DB` binding); `aws` builds a Lambda
+ * handler (S3 + CloudFront + Function URL, see
+ * docs/deploy-aws-s3-cloudfront.md). Unset keeps the Vercel output. The dev
  * server and preview are unchanged.
  */
 const deployTarget = (process.env.DEPLOY_TARGET ?? "").trim().toLowerCase();
 const nitroPreset =
   deployTarget === "cf" || deployTarget === "cloudflare"
     ? "cloudflare_module"
-    : deployTarget === "aws" || deployTarget === "amplify"
-      ? "aws_amplify"
+    : deployTarget === "aws" || deployTarget === "lambda"
+      ? "aws_lambda"
       : "vercel";
 
 // `0.0.0.0:8080` is the live-preview contract — don't change host/port.
@@ -185,6 +186,10 @@ export default defineConfig(({ command, isPreview }) => ({
       ? [
           nitro({
             preset: nitroPreset,
+            // The Lambda bundle has no filesystem access to .output/public, so
+            // asset contents are inlined — CloudFront still fronts /assets/*
+            // with S3, Lambda serves the rest itself.
+            serveStatic: nitroPreset === "aws_lambda" ? "inline" : undefined,
             // Auto-registers server/middleware/* (the PWA install page +
             // manifest + head-tag middleware). Nitro v3 defaults serverDir to
             // false, so removing this silently unwires /?install=1 on deploys.

@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Grokbot Mail on AWS, no Amplify: CloudFront serves /assets/* from S3 and
+  forwards everything else to a Lambda Function URL (both behind Origin
+  Access Control). Aurora Serverless v2 (PostgreSQL) with the RDS Data API is
+  the database. Deploy:
+  aws cloudformation deploy --stack-name grokbot-mail \
+    --template-file infra/s3-cloudfront-aurora.cfn.yaml \
+    --capabilities CAPABILITY_IAM \
+    --parameter-overrides GBMIngestToken=... GBMSessionSecret=...
+
+Parameters:
+  GBMIngestToken:
+    Type: String
+    NoEcho: true
+    Description: Bearer token for POST /api/ingest and /api/outbox (the bot).
+  GBMSessionSecret:
+    Type: String
+    NoEcho: true
+    Description: Cookie signing secret for the site gate.
+  GBMSitePassword:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Optional site password; empty disables the gate.
+  GBMInboxAddress:
+    Type: String
+    Default: ""
+  GBMOwnerName:
+    Type: String
+    Default: ""
+  DatabaseName:
+    Type: String
+    Default: postgres
+  MinAcu:
+    Type: Number
+    Default: 0
+    Description: Minimum ACUs. 0 = auto-pause (PG 16.3+/15.7+/14.12+).
+  MaxAcu:
+    Type: Number
+    Default: 4
+
+Resources:
+  # ---------- Static assets ----------
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+  # ---------- Compute ----------
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: rds-data-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds-data:ExecuteStatement
+                  - rds-data:BatchExecuteStatement
+                  - rds-data:BeginTransaction
+                  - rds-data:CommitTransaction
+                  - rds-data:RollbackTransaction
+                Resource: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DbCluster}"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt DbCluster.MasterUserSecret.SecretArn
+
+  AppFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt AppRole.Arn
+      MemorySize: 512
+      Timeout: 30
+      # Placeholder so the stack can be created before `npm run build:aws`;
+      # `aws lambda update-function-code` uploads the real bundle.
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({
+            statusCode: 503,
+            body: "deploy the app bundle (see docs/deploy-aws-s3-cloudfront.md)",
+          });
+      Environment:
+        Variables:
+          RDS_DATA_RESOURCE_ARN: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DbCluster}"
+          RDS_DATA_SECRET_ARN: !GetAtt DbCluster.MasterUserSecret.SecretArn
+          RDS_DATA_DATABASE: !Ref DatabaseName
+          GBM_INGEST_TOKEN: !Ref GBMIngestToken
+          GBM_SESSION_SECRET: !Ref GBMSessionSecret
+          GBM_SITE_PASSWORD: !Ref GBMSitePassword
+          GBM_INBOX_ADDRESS: !Ref GBMInboxAddress
+          GBM_OWNER_NAME: !Ref GBMOwnerName
+          GBM_DEMO: "0"
+
+  AppFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref AppFunction
+      AuthType: AWS_IAM # only CloudFront (signed via OAC) may invoke
+
+  AppFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AppFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      FunctionUrlAuthType: AWS_IAM
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+      InvokedViaFunctionUrl: true
+
+  # ---------- CloudFront ----------
+  S3Oac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-s3"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  LambdaOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-lambda"
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Grokbot Mail
+        HttpVersion: http2and3
+        Origins:
+          - Id: s3-assets
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt S3Oac.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+          - Id: lambda-app
+            DomainName: !Select [2, !Split ["/", !GetAtt AppFunctionUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt LambdaOac.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+        DefaultCacheBehavior:
+          TargetOriginId: lambda-app
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          Compress: true
+          # Managed-CachingDisabled + Managed-AllViewerExceptHostHeader
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CacheBehaviors:
+          - PathPattern: /assets/*
+            TargetOriginId: s3-assets
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            # Managed-CachingOptimized
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # ---------- Database ----------
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: gbm_admin
+      ManageMasterUserPassword: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinAcu
+        MaxCapacity: !Ref MaxAcu
+      EnableHttpEndpoint: true # <- this IS the RDS Data API
+      StorageEncrypted: true
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+
+Outputs:
+  SiteUrl:
+    Value: !Sub "https://${SiteDistribution.DomainName}"
+    Description: The app's public URL.
+  SiteBucketName:
+    Value: !Ref SiteBucket
+    Description: `aws s3 sync .output/public s3://<this> --delete`
+  FunctionName:
+    Value: !Ref AppFunction
+    Description: `aws lambda update-function-code --function-name <this> --zip-file fileb://.output/lambda.zip`
+  ResourceArn:
+    Value: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DbCluster}"
+  SecretArn:
+    Value: !GetAtt DbCluster.MasterUserSecret.SecretArn
