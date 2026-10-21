@@ -23,9 +23,10 @@ function asState(row: SecurityRow | undefined): SecurityState {
   };
 }
 
-/** True when a real database backs the app — DATABASE_URL, or D1 on Workers. */
+/** True when a real database backs the app — DATABASE_URL, D1 on Workers, or the Aurora Data API. */
 export function passwordChangesEnabled(): boolean {
   if (databaseConfigured(process.env.DATABASE_URL)) return true;
+  if (process.env.RDS_DATA_RESOURCE_ARN?.trim()) return true;
   return (
     typeof navigator !== "undefined" &&
     navigator.userAgent === "Cloudflare-Workers"

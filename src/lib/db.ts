@@ -2,7 +2,7 @@ import { pendingMigrations } from "../../scripts/migration-plan.mjs";
 import { neonPoolConfig } from "./pg-pool.ts";
 
 /** Which database backend is active. */
-export type DbSource = "neon" | "pglite" | "d1";
+export type DbSource = "neon" | "pglite" | "d1" | "rdsdata";
 
 // An empty/whitespace DATABASE_URL (an easy misconfig in deploy UIs) must mean
 // "unset" — otherwise production would silently run on the PGLite fallback.
@@ -21,17 +21,28 @@ export const isWorkersRuntime =
   navigator.userAgent === "Cloudflare-Workers";
 
 /**
+ * Aurora Serverless Data API is selected by its cluster ARN — Lambda compute
+ * reaches it over HTTPS, no TCP and no DATABASE_URL.
+ */
+const rdsDataConfigured = Boolean(
+  typeof process !== "undefined" && process.env.RDS_DATA_RESOURCE_ARN?.trim(),
+);
+
+/**
  * Active backend: real **Neon** when `DATABASE_URL` is set (deployed / configured
- * sandbox), Cloudflare **D1** under the Workers runtime (`DB` binding), otherwise
- * a local embedded **PGLite** (Postgres compiled to WASM) so the app has a
- * working database even with nothing configured — the live preview included.
- * Swap in Neon later by just setting `DATABASE_URL`; no code changes.
+ * sandbox), Cloudflare **D1** under the Workers runtime (`DB` binding), **Aurora
+ * Serverless Data API** when `RDS_DATA_RESOURCE_ARN`/`RDS_DATA_SECRET_ARN` are
+ * set, otherwise a local embedded **PGLite** (Postgres compiled to WASM) so the
+ * app has a working database even with nothing configured — the live preview
+ * included. Swap in Neon later by just setting `DATABASE_URL`; no code changes.
  */
 export const dbSource: DbSource = databaseUrl
   ? "neon"
-  : isWorkersRuntime
-    ? "d1"
-    : "pglite";
+  : rdsDataConfigured
+    ? "rdsdata"
+    : isWorkersRuntime
+      ? "d1"
+      : "pglite";
 
 /**
  * Minimal shared SQL surface, satisfied by both Neon and PGLite. Both the
@@ -173,6 +184,25 @@ async function createD1Sql(): Promise<Sql> {
   return sql;
 }
 
+/**
+ * Aurora Serverless via the RDS Data API — HTTP + IAM signed calls, no TCP.
+ * `RDS_DATA_RESOURCE_ARN` / `RDS_DATA_SECRET_ARN` select it (see
+ * docs/deploy-aws-aurora-serverless.md).
+ */
+async function createRdsDataSql(): Promise<Sql> {
+  const { rdsDataSql, rdsDataConfigFromEnv, migrateRdsData } = await import(
+    "./rds-data-sql.ts"
+  );
+  const cfg = rdsDataConfigFromEnv();
+  if (!cfg) {
+    throw new Error("RDS_DATA_RESOURCE_ARN and RDS_DATA_SECRET_ARN are not set");
+  }
+  const { RDSDataClient } = await import("@aws-sdk/client-rds-data");
+  const sql = rdsDataSql(new RDSDataClient({}), cfg);
+  await migrateRdsData(sql);
+  return sql;
+}
+
 async function createPgliteSql(): Promise<Sql> {
   // Embedded Postgres, imported on demand so it never loads on the Neon path.
   // One in-memory instance per process, shared across HMR module instances, so
@@ -250,6 +280,7 @@ async function createSql(): Promise<Sql> {
   }
   if (dbSource === "neon") return createNeonSql();
   if (dbSource === "d1") return createD1Sql();
+  if (dbSource === "rdsdata") return createRdsDataSql();
   return createPgliteSql();
 }
 

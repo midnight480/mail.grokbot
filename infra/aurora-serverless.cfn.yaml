@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Grokbot Mail database — Aurora Serverless v2 (PostgreSQL) with the RDS Data
+  API enabled, plus the IAM policy the Amplify compute role needs. Deploy:
+  aws cloudformation deploy --stack-name grokbot-mail-db \
+    --template-file infra/aurora-serverless.cfn.yaml --capabilities CAPABILITY_IAM
+
+Parameters:
+  DatabaseName:
+    Type: String
+    Default: postgres
+    Description: Initial database created in the cluster.
+  MinAcu:
+    Type: Number
+    Default: 0
+    Description: >-
+      Minimum Aurora Capacity Units. 0 = auto-pause when idle (PostgreSQL
+      16.3+/15.7+/14.12+). First Data API call after a pause takes a few
+      seconds while the cluster resumes — fine for this mailbox.
+  MaxAcu:
+    Type: Number
+    Default: 4
+    Description: Maximum Aurora Capacity Units; 4 ACU ≈ 8 GiB is generous here.
+
+Resources:
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: gbm_admin
+      ManageMasterUserPassword: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinAcu
+        MaxCapacity: !Ref MaxAcu
+      EnableHttpEndpoint: true # <- this IS the RDS Data API
+      StorageEncrypted: true
+      DeletionProtection: false
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+
+  # Attach to the Amplify app's compute/backend role — the Data API call is
+  # IAM-signed, and GetSecretValue is how AWS itself resolves the credentials
+  # (the secret value never reaches app code).
+  DbAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: RDS Data API + cluster secret access for Grokbot Mail.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - rds-data:ExecuteStatement
+              - rds-data:BatchExecuteStatement
+              - rds-data:BeginTransaction
+              - rds-data:CommitTransaction
+              - rds-data:RollbackTransaction
+            Resource: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DbCluster}"
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !GetAtt DbCluster.MasterUserSecret.SecretArn
+
+Outputs:
+  ResourceArn:
+    Description: RDS_DATA_RESOURCE_ARN
+    Value: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DbCluster}"
+  SecretArn:
+    Description: RDS_DATA_SECRET_ARN
+    Value: !GetAtt DbCluster.MasterUserSecret.SecretArn
+  DatabaseName:
+    Description: RDS_DATA_DATABASE
+    Value: !Ref DatabaseName
+  DbAccessPolicyArn:
+    Description: Managed policy to attach to the Amplify compute role.
+    Value: !Ref DbAccessPolicy
