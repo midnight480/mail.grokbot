@@ -28,7 +28,7 @@ import {
   type SqlParameter,
 } from "@aws-sdk/client-rds-data";
 import { pendingMigrations } from "../../scripts/migration-plan.mjs";
-import { toSql, type Sql } from "./db.ts";
+import { toSql, type Sql } from "./sql-types.ts";
 
 export type RdsDataConfig = {
   resourceArn: string;
