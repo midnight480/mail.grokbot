@@ -2,7 +2,7 @@ import { pendingMigrations } from "../../scripts/migration-plan.mjs";
 import { neonPoolConfig } from "./pg-pool.ts";
 
 /** Which database backend is active. */
-export type DbSource = "neon" | "pglite";
+export type DbSource = "neon" | "pglite" | "d1";
 
 // An empty/whitespace DATABASE_URL (an easy misconfig in deploy UIs) must mean
 // "unset" — otherwise production would silently run on the PGLite fallback.
@@ -12,12 +12,26 @@ const databaseUrl =
   rawDatabaseUrl && rawDatabaseUrl.trim() ? rawDatabaseUrl : undefined;
 
 /**
- * Active backend: real **Neon** when `DATABASE_URL` is set (deployed / configured
- * sandbox), otherwise a local embedded **PGLite** (Postgres compiled to WASM) so
- * the app has a working database even with nothing configured — the live preview
- * included. Swap in Neon later by just setting `DATABASE_URL`; no code changes.
+ * Cloudflare Workers reports `navigator.userAgent === "Cloudflare-Workers"`.
+ * Used only to pick the default backend when DATABASE_URL is unset: on Workers
+ * there is no durable local Postgres, so the D1 `DB` binding is the database.
  */
-export const dbSource: DbSource = databaseUrl ? "neon" : "pglite";
+export const isWorkersRuntime =
+  typeof navigator !== "undefined" &&
+  navigator.userAgent === "Cloudflare-Workers";
+
+/**
+ * Active backend: real **Neon** when `DATABASE_URL` is set (deployed / configured
+ * sandbox), Cloudflare **D1** under the Workers runtime (`DB` binding), otherwise
+ * a local embedded **PGLite** (Postgres compiled to WASM) so the app has a
+ * working database even with nothing configured — the live preview included.
+ * Swap in Neon later by just setting `DATABASE_URL`; no code changes.
+ */
+export const dbSource: DbSource = databaseUrl
+  ? "neon"
+  : isWorkersRuntime
+    ? "d1"
+    : "pglite";
 
 /**
  * Minimal shared SQL surface, satisfied by both Neon and PGLite. Both the
@@ -36,6 +50,14 @@ export interface Sql {
     text: string,
     params?: unknown[],
   ): Promise<T[]>;
+  /** Dialect tag for the few queries whose SQL differs between Postgres and SQLite. */
+  dialect?: "pg" | "sqlite";
+  /**
+   * Run `fn` inside a write transaction: commit on success, rollback on throw.
+   * Backends without interactive transactions (D1) leave this unset — see
+   * `runWriteTx` in `./sql-tx.ts` for the shared call site.
+   */
+  tx?<T>(fn: () => Promise<T>): Promise<T>;
 }
 
 /**
@@ -71,7 +93,7 @@ const identity = (v: string) => v;
 type Run = <T>(text: string, params: unknown[]) => Promise<T[]>;
 
 /** Wrap a query runner in the tagged-template + `.query()` `Sql` surface. */
-function toSql(run: Run): Sql {
+export function toSql(run: Run): Sql {
   const sql = (async <T = Record<string, unknown>>(
     strings: TemplateStringsArray,
     ...values: unknown[]
@@ -86,6 +108,25 @@ function toSql(run: Run): Sql {
   return sql;
 }
 
+/** `begin`/`commit`/`rollback` over plain statements — the Postgres-backed tx. */
+export function txOverStatements(run: Run): NonNullable<Sql["tx"]> {
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    await run("begin", []);
+    try {
+      const value = await fn();
+      await run("commit", []);
+      return value;
+    } catch (err) {
+      try {
+        await run("rollback", []);
+      } catch {
+        // The failed transaction is already unusable.
+      }
+      throw err;
+    }
+  };
+}
+
 function createNeonSql(): Promise<Sql> {
   globalRef.__pgSqlPromise__ ??= (async () => {
     // Regular Postgres driver: node-postgres (`pg`) — works directly with Neon's
@@ -97,15 +138,39 @@ function createNeonSql(): Promise<Sql> {
     types.setTypeParser(OID_DATE, identity);
     types.setTypeParser(OID_INTERVAL, identity);
     const pool = new Pool(neonPoolConfig(databaseUrl));
-    return toSql(async <T>(text: string, params: unknown[]) => {
+    const run = async <T>(text: string, params: unknown[]) => {
       const res = await pool.query(text, params);
       return res.rows as T[];
-    });
+    };
+    const sql = toSql(run);
+    sql.dialect = "pg";
+    sql.tx = txOverStatements(run);
+    return sql;
   })().catch((err) => {
     globalRef.__pgSqlPromise__ = undefined;
     throw err;
   });
   return globalRef.__pgSqlPromise__;
+}
+
+/**
+ * Cloudflare D1 — the `DB` binding from `wrangler.jsonc`. `cloudflare:workers`
+ * is resolved through a variable specifier so non-Workers bundles (Vercel,
+ * Lambda) neither resolve nor bundle it.
+ */
+async function createD1Sql(): Promise<Sql> {
+  const { d1Sql, migrateD1 } = await import("./d1-sql.ts");
+  const specifier = "cloudflare:workers";
+  const mod = (await import(/* @vite-ignore */ specifier)) as {
+    env: Record<string, unknown>;
+  };
+  const binding = mod.env.DB as import("./d1-sql.ts").D1DatabaseLike | undefined;
+  if (!binding) {
+    throw new Error('Cloudflare D1 binding "DB" is not configured in wrangler.jsonc');
+  }
+  const sql = d1Sql(binding);
+  await migrateD1(sql, binding);
+  return sql;
 }
 
 async function createPgliteSql(): Promise<Sql> {
@@ -164,10 +229,14 @@ async function createPgliteSql(): Promise<Sql> {
   globalRef.__pgliteMigrateChain__ = pass;
   await pass;
 
-  return toSql(async <T>(text: string, params: unknown[]) => {
+  const run = async <T>(text: string, params: unknown[]) => {
     const result = await pg.query<T>(text, params);
     return result.rows;
-  });
+  };
+  const sql = toSql(run);
+  sql.dialect = "pg";
+  sql.tx = txOverStatements(run);
+  return sql;
 }
 
 let sqlPromise: Promise<Sql> | null = null;
@@ -179,7 +248,9 @@ async function createSql(): Promise<Sql> {
         "or a server route loader, never from client code.",
     );
   }
-  return dbSource === "neon" ? createNeonSql() : createPgliteSql();
+  if (dbSource === "neon") return createNeonSql();
+  if (dbSource === "d1") return createD1Sql();
+  return createPgliteSql();
 }
 
 /**
@@ -217,13 +288,15 @@ export async function getPglite(): Promise<import("@electric-sql/pglite").PGlite
  *
  * - **PGLite** (preview / no `DATABASE_URL`): open the in-memory DB and apply
  *   `migrations/*.sql`. Idempotent — concurrent callers share one promise.
+ * - **D1** (Workers): apply `migrations/*.sql` (rewritten for SQLite) on the
+ *   first call.
  * - **Neon**: no-op (pool is created lazily on first query).
  *
  * Vite `configureServer` awaits this at dev startup; production imports of this
  * module kick it off immediately (see bottom of file).
  */
 export function ensureDbReady(): Promise<void> {
-  if (dbSource !== "pglite") return Promise.resolve();
+  if (dbSource === "neon") return Promise.resolve();
   return getSql().then(() => undefined);
 }
 

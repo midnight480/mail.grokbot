@@ -142,6 +142,20 @@ function authPopupPlugin(): Plugin {
   };
 }
 
+/**
+ * Deploy target for the production build. `DEPLOY_TARGET=cf` builds the
+ * Cloudflare Workers module (D1 via the `DB` binding); `aws`/`amplify` builds
+ * the AWS Amplify compute bundle. Unset keeps the Vercel output. The dev
+ * server and preview are unchanged.
+ */
+const deployTarget = (process.env.DEPLOY_TARGET ?? "").trim().toLowerCase();
+const nitroPreset =
+  deployTarget === "cf" || deployTarget === "cloudflare"
+    ? "cloudflare_module"
+    : deployTarget === "aws" || deployTarget === "amplify"
+      ? "aws_amplify"
+      : "vercel";
+
 // `0.0.0.0:8080` is the live-preview contract — don't change host/port.
 // The dev server starts once `src/router.tsx` and `src/routes/` exist — see
 // AGENTS.md § "First scaffold".
@@ -170,7 +184,7 @@ export default defineConfig(({ command, isPreview }) => ({
     ...(command === "build" || isPreview
       ? [
           nitro({
-            preset: "vercel",
+            preset: nitroPreset,
             // Auto-registers server/middleware/* (the PWA install page +
             // manifest + head-tag middleware). Nitro v3 defaults serverDir to
             // false, so removing this silently unwires /?install=1 on deploys.

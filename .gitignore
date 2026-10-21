@@ -7,6 +7,9 @@ node_modules/
 .env.*
 !.env.example
 .vercel/
+.output/
+.wrangler/
+.dev.vars
 data/config.json
 data/outbox.log
 data/ingest/**

@@ -634,7 +634,8 @@ describe("site gate without a database", () => {
     );
     assert.match(store, /await import\("\.\.\/db\.ts"\)/);
     assert.doesNotMatch(store, /pglite|PGlite|@electric-sql\/pglite/);
-    assert.match(db, /dbSource === "neon" \? createNeonSql\(\) : createPgliteSql\(\)/);
+    assert.match(db, /if \(dbSource === "neon"\) return createNeonSql\(\)/);
+    assert.match(db, /return createPgliteSql\(\)/);
     assert.match(db, /neonPoolConfig\(/);
     assert.match(settings, /editable === true/);
     assert.match(settings, /Change password/);

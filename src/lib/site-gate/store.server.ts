@@ -23,9 +23,13 @@ function asState(row: SecurityRow | undefined): SecurityState {
   };
 }
 
-/** True only when a real DATABASE_URL is set. Whitespace counts as unset. */
+/** True when a real database backs the app — DATABASE_URL, or D1 on Workers. */
 export function passwordChangesEnabled(): boolean {
-  return databaseConfigured(process.env.DATABASE_URL);
+  if (databaseConfigured(process.env.DATABASE_URL)) return true;
+  return (
+    typeof navigator !== "undefined" &&
+    navigator.userAgent === "Cloudflare-Workers"
+  );
 }
 
 function envSecurity(): SecurityState {
@@ -53,11 +57,11 @@ export async function savePasswordHash(passwordHash: string): Promise<SecuritySt
   const sql = await getSql();
   const rows = await sql<SecurityRow>`
     insert into site_security (id, password_hash, session_version, updated_at)
-    values ('site', ${passwordHash}, 1, now())
+    values ('site', ${passwordHash}, 1, current_timestamp)
     on conflict (id) do update set
       password_hash = excluded.password_hash,
       session_version = site_security.session_version + 1,
-      updated_at = now()
+      updated_at = current_timestamp
     returning password_hash, session_version
   `;
   const state = asState(rows[0]);

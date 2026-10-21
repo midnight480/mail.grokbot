@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "grokbot-mail",
+  // `main`, `assets`, `compatibility_date`, and `nodejs_compat` are injected by
+  // Nitro at build time (`npm run build:cf` writes .output/server/wrangler.json
+  // merged with this file). Only app resources and settings live here.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "grokbot-mail",
+      // `wrangler d1 create grokbot-mail` prints the id — paste it here.
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+    },
+  ],
+  "observability": { "enabled": true },
+  "vars": {
+    // The D1 binding is the database, so sample-mail demo mode stays off.
+    "GBM_DEMO": "0",
+  },
+}

@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { Sql } from "../../lib/db.ts";
+import { runWriteTx } from "../../lib/sql-tx.ts";
 import type { Address, Alias, Attachment, Message } from "../../lib/mail/model.ts";
 import { normalizePath } from "../../lib/site-gate/paths.ts";
 import { runDueWakes } from "./wake.server.ts";
@@ -173,6 +174,20 @@ function placeholders(values: readonly unknown[], start: number): string {
 }
 
 /**
+ * SQLite approximation of Postgres
+ * `lower(regexp_replace(trim(subject), '\s+', ' ', 'g'))`: folds ASCII
+ * whitespace to spaces, then collapses doubled spaces twice. A prefilter only
+ * — the real twin ranking happens in `fuzzySentDistance` in JS.
+ */
+function sqliteSubjectNorm(): string {
+  let expr = "trim(subject)";
+  for (const code of [9, 10, 11, 12, 13]) {
+    expr = `replace(${expr}, char(${code}), ' ')`;
+  }
+  return `lower(replace(replace(${expr}, '  ', ' '), '  ', ' '))`;
+}
+
+/**
  * The other copy of a sent email, when there is one: the app's own row for a
  * copy from the bot inbox, or the inbox copy for the app's row. Matched by
  * provider message id or Message-ID, then by from, to, subject, and a close time.
@@ -183,9 +198,16 @@ async function findSentTwin(sql: Sql, message: Message): Promise<SentTwin | null
   const keys = app ? appSentKeys(message) : copyKeys(message);
   const idKeys = app ? keys : keys.map((item) => `msg_${item}`);
   const params: unknown[] = [message.id, message.subject.replace(/\s+/g, " ").trim().toLowerCase()];
+  const sqlite = sql.dialect === "sqlite";
+  const midNorm = sqlite
+    ? "lower(trim(coalesce(message_id, ''), '<>'))"
+    : "lower(trim(both '<>' from coalesce(message_id, '')))";
+  const subjectNorm = sqlite
+    ? sqliteSubjectNorm()
+    : "lower(regexp_replace(trim(subject), '\\s+', ' ', 'g'))";
   const idList = idKeys.length > 0 ? `lower(id) in (${placeholders(idKeys, params.length + 1)})` : "false";
   params.push(...idKeys);
-  const midList = keys.length > 0 ? `lower(trim(both '<>' from coalesce(message_id, ''))) in (${placeholders(keys, params.length + 1)})` : "false";
+  const midList = keys.length > 0 ? `${midNorm} in (${placeholders(keys, params.length + 1)})` : "false";
   params.push(...keys);
   const side = app ? "client_send_id is null" : "client_send_id is not null";
   const rows = await sql.query<{
@@ -205,7 +227,7 @@ async function findSentTwin(sql: Sql, message: Message): Promise<SentTwin | null
             attachments_json
      from mail_message
      where id <> $1 and ${side}
-       and (${idList} or ${midList} or lower(regexp_replace(trim(subject), '\\s+', ' ', 'g')) = $2)
+       and (${idList} or ${midList} or ${subjectNorm} = $2)
      limit 50`,
     params,
   );
@@ -262,7 +284,7 @@ export async function upsertMessage(
   const messageId = textOrNull(message.messageId);
   const id = message.id;
   const matches = await sql.query<{ id: string }>(
-    `select id from mail_message where id = $1 or ($2::text is not null and message_id = $2)`,
+    `select id from mail_message where id = $1 or message_id = $2`,
     [id, messageId],
   );
   const ids = matches.map((row) => String(row.id));
@@ -389,10 +411,9 @@ async function upsertSendResult(sql: Sql, result: SendResult): Promise<void> {
 }
 
 async function applyItems(sql: Sql, items: StoredItem[]): Promise<{ accepted: number; skipped: number }> {
-  let accepted = 0;
   const updatedAt = new Date().toISOString();
-  await sql.query("begin");
-  try {
+  const accepted = await runWriteTx(sql, async () => {
+    let count = 0;
     for (const item of items) {
       if (item.kind === "account") await upsertAccount(sql, item.identity, updatedAt);
       else if (item.kind === "message") await upsertMessage(sql, item.message, item.unread, item.attachmentContent);
@@ -415,17 +436,10 @@ async function applyItems(sql: Sql, items: StoredItem[]): Promise<{ accepted: nu
         const { applySendResultToOutbound } = await import("./outbox-api.server.ts");
         await applySendResultToOutbound(sql, item.result);
       }
-      accepted += 1;
+      count += 1;
     }
-    await sql.query("commit");
-  } catch (err) {
-    try {
-      await sql.query("rollback");
-    } catch {
-      // The failed transaction is already unusable.
-    }
-    throw err;
-  }
+    return count;
+  });
   return { accepted, skipped: 0 };
 }
 

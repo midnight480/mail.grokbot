@@ -1,4 +1,5 @@
 import type { Sql } from "../../lib/db.ts";
+import { abortTx, runWriteTx } from "../../lib/sql-tx.ts";
 import { demoMode, sitePassword } from "../../lib/env.server.ts";
 import type { Address, Attachment, Message } from "../../lib/mail/model.ts";
 import {
@@ -425,22 +426,22 @@ async function readStatusBody(request: Request): Promise<StatusInput | Response>
   };
 }
 
+/**
+ * `run` inside a write transaction where the backend has one (Postgres);
+ * sequential statements on D1. A refused transition aborts the write the same
+ * way either way — the guarded UPDATE in `transitionOutbound` stays the
+ * correctness boundary (status compare-and-swap is atomic per row).
+ */
 async function withTransaction(sql: Sql, run: () => Promise<TransitionResult>): Promise<Response> {
-  await sql.query("begin");
   try {
-    const result = await run();
-    if (!result.ok) {
-      await sql.query("rollback");
-      return json(result.status, { error: result.error });
-    }
-    await sql.query("commit");
+    const result = await runWriteTx<TransitionResult>(sql, async () => {
+      const next = await run();
+      if (!next.ok) abortTx(next);
+      return next;
+    });
+    if (!result.ok) return json(result.status, { error: result.error });
     return json(200, { id: result.id, status: result.status });
   } catch (err) {
-    try {
-      await sql.query("rollback");
-    } catch {
-      // The failed transaction is already unusable.
-    }
     console.error("[outbox] write failed", err instanceof Error ? err.name : "error");
     return json(503, { error: "unavailable" });
   }

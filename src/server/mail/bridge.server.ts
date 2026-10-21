@@ -21,8 +21,13 @@ export function outboxRecord(action: string, status: number | null, error: strin
 }
 
 async function writeOutbox(path: string, action: string, status: number | null, error: string) {
-  await mkdir(dirname(path), { recursive: true });
-  await appendFile(path, outboxRecord(action, status, error), "utf8");
+  try {
+    await mkdir(dirname(path), { recursive: true });
+    await appendFile(path, outboxRecord(action, status, error), "utf8");
+  } catch {
+    // No filesystem (Workers, Lambda): keep the failure in logs instead.
+    console.error("[outbox]", outboxRecord(action, status, error).trim());
+  }
 }
 
 /** One header. Bearer unless the saved connection asks for the webhook-key header. */
