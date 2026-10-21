@@ -9,6 +9,7 @@ node_modules/
 .vercel/
 .output/
 .wrangler/
+.amplify-hosting/
 .dev.vars
 data/config.json
 data/outbox.log

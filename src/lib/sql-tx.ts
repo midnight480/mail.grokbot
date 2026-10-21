@@ -1,4 +1,4 @@
-import type { Sql } from "./db.ts";
+import type { Sql } from "./sql-types.ts";
 
 /**
  * Thrown inside a `runWriteTx` callback to abort the write and return `value`
