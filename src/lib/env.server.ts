@@ -45,14 +45,14 @@ const isWorkers =
 
 /**
  * Demo mode serves invented sample mail so anyone can try the app.
- * On with GBM_DEMO=1, or when no database is available (no DATABASE_URL and
- * not on Workers/D1). GBM_DEMO=0 turns it off.
+ * On with GBM_DEMO=1, or when no database is available (no DATABASE_URL, not
+ * on Workers/D1, no Aurora DSQL endpoint). GBM_DEMO=0 turns it off.
  */
 export function demoMode(): boolean {
   const flag = env("GBM_DEMO");
   if (flag === "1" || flag === "true") return true;
   if (flag === "0" || flag === "false") return false;
-  return !env("DATABASE_URL") && !isWorkers;
+  return !env("DATABASE_URL") && !isWorkers && !env("DSQL_CLUSTER_ENDPOINT");
 }
 
 export type OwnerConfig = {

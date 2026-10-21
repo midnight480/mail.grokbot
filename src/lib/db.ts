@@ -2,7 +2,7 @@ import { pendingMigrations } from "../../scripts/migration-plan.mjs";
 import { neonPoolConfig } from "./pg-pool.ts";
 
 /** Which database backend is active. */
-export type DbSource = "neon" | "pglite" | "d1";
+export type DbSource = "neon" | "pglite" | "d1" | "dsql";
 
 // An empty/whitespace DATABASE_URL (an easy misconfig in deploy UIs) must mean
 // "unset" — otherwise production would silently run on the PGLite fallback.
@@ -21,17 +21,28 @@ export const isWorkersRuntime =
   navigator.userAgent === "Cloudflare-Workers";
 
 /**
+ * Aurora DSQL is selected by its cluster endpoint — real Postgres wire
+ * protocol, IAM-signed instead of a password.
+ */
+const dsqlConfigured = Boolean(
+  typeof process !== "undefined" && process.env.DSQL_CLUSTER_ENDPOINT?.trim(),
+);
+
+/**
  * Active backend: real **Neon** when `DATABASE_URL` is set (deployed / configured
- * sandbox), Cloudflare **D1** under the Workers runtime (`DB` binding), otherwise
- * a local embedded **PGLite** (Postgres compiled to WASM) so the app has a
- * working database even with nothing configured — the live preview included.
- * Swap in Neon later by just setting `DATABASE_URL`; no code changes.
+ * sandbox), Cloudflare **D1** under the Workers runtime (`DB` binding), **Aurora
+ * DSQL** when `DSQL_CLUSTER_ENDPOINT` is set, otherwise a local embedded
+ * **PGLite** (Postgres compiled to WASM) so the app has a working database even
+ * with nothing configured — the live preview included. Swap in Neon later by
+ * just setting `DATABASE_URL`; no code changes.
  */
 export const dbSource: DbSource = databaseUrl
   ? "neon"
-  : isWorkersRuntime
-    ? "d1"
-    : "pglite";
+  : dsqlConfigured
+    ? "dsql"
+    : isWorkersRuntime
+      ? "d1"
+      : "pglite";
 
 /**
  * Minimal shared SQL surface, satisfied by both Neon and PGLite. Both the
@@ -173,6 +184,32 @@ async function createD1Sql(): Promise<Sql> {
   return sql;
 }
 
+/**
+ * Aurora DSQL — the official `AuroraDSQLPool` (pg subclass) signs each
+ * connection with IAM. `DSQL_CLUSTER_ENDPOINT` selects it (see
+ * docs/deploy-aws-aurora-dsql.md).
+ */
+async function createDsqlSql(): Promise<Sql> {
+  const { dsqlSql, dsqlConfigFromEnv, migrateDsql } = await import(
+    "./dsql-sql.ts"
+  );
+  const cfg = dsqlConfigFromEnv();
+  if (!cfg) throw new Error("DSQL_CLUSTER_ENDPOINT is not set");
+  const { AuroraDSQLPool } = await import(
+    "@aws/aurora-dsql-node-postgres-connector"
+  );
+  const { types } = await import("pg");
+  types.setTypeParser(OID_INT8, Number);
+  types.setTypeParser(OID_DATE, identity);
+  types.setTypeParser(OID_INTERVAL, identity);
+  // max: 1 — one connection per warm Lambda instance keeps the mailbox
+  // workload serialized and pool-hold trivial.
+  const pool = new AuroraDSQLPool({ ...cfg, max: 1 });
+  const sql = dsqlSql(pool);
+  await migrateDsql(sql);
+  return sql;
+}
+
 async function createPgliteSql(): Promise<Sql> {
   // Embedded Postgres, imported on demand so it never loads on the Neon path.
   // One in-memory instance per process, shared across HMR module instances, so
@@ -250,6 +287,7 @@ async function createSql(): Promise<Sql> {
   }
   if (dbSource === "neon") return createNeonSql();
   if (dbSource === "d1") return createD1Sql();
+  if (dbSource === "dsql") return createDsqlSql();
   return createPgliteSql();
 }
 

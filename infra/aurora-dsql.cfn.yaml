@@ -1,0 +1,37 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Grokbot Mail database — Aurora DSQL cluster plus the IAM policy the Amplify
+  compute role needs (dsql:DbConnectAdmin). Deploy:
+  aws cloudformation deploy --stack-name grokbot-mail-dsql \
+    --template-file infra/aurora-dsql.cfn.yaml --capabilities CAPABILITY_IAM
+
+Resources:
+  DsqlCluster:
+    Type: AWS::DSQL::Cluster
+    Properties:
+      DeletionProtectionEnabled: false
+
+  # Attach to the Amplify app's compute/backend role. There is no password:
+  # the app signs each connection with getDbConnectAdminAuthToken, and this
+  # action is what permits it.
+  DsqlAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Aurora DSQL connect for Grokbot Mail.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: dsql:DbConnectAdmin
+            Resource: !GetAtt DsqlCluster.ResourceArn
+
+Outputs:
+  ClusterEndpoint:
+    Description: DSQL_CLUSTER_ENDPOINT
+    Value: !GetAtt DsqlCluster.Endpoint
+  ClusterArn:
+    Description: Cluster ARN (the IAM resource).
+    Value: !GetAtt DsqlCluster.ResourceArn
+  DsqlAccessPolicyArn:
+    Description: Managed policy to attach to the Amplify compute role.
+    Value: !Ref DsqlAccessPolicy
